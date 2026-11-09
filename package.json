@@ -1,5 +1,5 @@
 {
-  "name": "figma-make-app",
+  "name": "schoolpc-admin-web",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -10,8 +10,11 @@
     "format": "oxfmt"
   },
   "dependencies": {
+    "@fontsource/dm-sans": "^5.3.0",
+    "@fontsource/manrope": "^5.3.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.18.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
