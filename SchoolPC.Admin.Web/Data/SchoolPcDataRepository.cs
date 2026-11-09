@@ -14,7 +14,7 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             SELECT
                 (SELECT COUNT(*) FROM pc_instances WHERE is_active = TRUE) AS totalComputers,
                 (SELECT COUNT(*) FROM pc_instances
-                    WHERE is_active = TRUE AND last_seen >= NOW() - INTERVAL 5 MINUTE) AS onlineComputers,
+                    WHERE is_active = TRUE AND last_seen >= NOW() - INTERVAL 1 MINUTE) AS onlineComputers,
                 (SELECT COUNT(*) FROM sessions WHERE login_time >= CURRENT_DATE()) AS sessionsToday,
                 (SELECT COUNT(*) FROM problem_reports WHERE status = 'open') AS openReports
             """;
@@ -36,7 +36,7 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 pc.current_pc_name,
                 pc.ip_address,
                 DATE_FORMAT(pc.last_seen, '%Y-%m-%dT%H:%i:%s') AS last_seen,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 5 MINUTE THEN TRUE ELSE FALSE END AS is_online,
+                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN TRUE ELSE FALSE END AS is_online,
                 COUNT(s.session_id) AS session_count,
                 g.group_name
             FROM pc_instances pc
@@ -80,10 +80,10 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 pc.ip_address,
                 DATE_FORMAT(pc.last_seen, '%Y-%m-%dT%H:%i:%s') AS last_seen,
                 DATE_FORMAT(pc.first_seen, '%Y-%m-%dT%H:%i:%s') AS first_seen,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 5 MINUTE THEN TRUE ELSE FALSE END AS is_online,
+                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN TRUE ELSE FALSE END AS is_online,
                 (SELECT COUNT(*) FROM sessions s
                     WHERE s.client_guid = pc.client_guid AND s.login_time >= CURRENT_DATE()) AS sessions_today,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 5 MINUTE THEN
+                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN
                     (SELECT s.student_name FROM sessions s
                         WHERE s.client_guid = pc.client_guid AND s.logout_time IS NULL
                         ORDER BY s.login_time DESC LIMIT 1)
@@ -153,7 +153,7 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 COALESCE(s.duration_minutes,
                     CASE WHEN s.logout_time IS NOT NULL AND s.login_time IS NOT NULL
                         THEN TIMESTAMPDIFF(MINUTE, s.login_time, s.logout_time) END) AS duration_minutes,
-                CASE WHEN s.logout_time IS NULL AND pc.last_seen >= NOW() - INTERVAL 5 MINUTE
+                CASE WHEN s.logout_time IS NULL AND pc.last_seen >= NOW() - INTERVAL 1 MINUTE
                     THEN 'In use'
                     ELSE COALESCE(NULLIF(s.end_reason, ''), '—')
                 END AS remarks
