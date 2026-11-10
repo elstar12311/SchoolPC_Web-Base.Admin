@@ -310,13 +310,7 @@ export default function ProblemReportsPage() {
             </div>
             <div className="modal-body">
               <div className="modal-status-row">
-                <span
-                  className={`report-status ${selectedReport.status.toLowerCase() === "resolved" ? "is-resolved" : "is-open"}`}
-                >
-                  <i />
-                  {selectedReport.status}
-                </span>
-                <time>{formatDateTime(selectedReport.createdAt)}</time>
+                <time>Reported {formatDateTime(selectedReport.createdAt)}</time>
               </div>
               <div className="issue-detail">
                 <span>Issue description</span>
@@ -330,10 +324,6 @@ export default function ProblemReportsPage() {
                 <div>
                   <span>Student ID</span>
                   <strong>{selectedReport.studentId}</strong>
-                </div>
-                <div>
-                  <span>Client ID</span>
-                  <strong>{selectedReport.clientGuid}</strong>
                 </div>
                 {selectedReport.status.toLowerCase() === "resolved" && (
                   <>

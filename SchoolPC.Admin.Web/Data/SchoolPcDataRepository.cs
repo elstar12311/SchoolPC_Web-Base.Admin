@@ -5,16 +5,16 @@ namespace SchoolPC.Admin.Web.Data;
 
 internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
 {
-    public async Task<LogbookData> GetLogbookAsync()
+    public async Task<LogbookData> GetLogbookAsync(int? groupId, bool ungrouped)
     {
         await using var connection = database.CreateConnection();
         await connection.OpenAsync();
 
         const string summaryQuery = """
             SELECT
-                (SELECT COUNT(*) FROM pc_instances WHERE is_active = TRUE) AS totalComputers,
+                (SELECT COUNT(*) FROM pc_instances) AS totalComputers,
                 (SELECT COUNT(*) FROM pc_instances
-                    WHERE is_active = TRUE AND last_seen >= NOW() - INTERVAL 1 MINUTE) AS onlineComputers,
+                    WHERE TIMESTAMPDIFF(SECOND, last_seen, NOW()) <= 120) AS onlineComputers,
                 (SELECT COUNT(*) FROM sessions WHERE login_time >= CURRENT_DATE()) AS sessionsToday,
                 (SELECT COUNT(*) FROM problem_reports WHERE status = 'open') AS openReports
             """;
@@ -29,26 +29,48 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             summaryReader.GetInt64("openReports"));
         await summaryReader.CloseAsync();
 
-        const string computersQuery = """
+        var conditions = new List<string>();
+        if (groupId.HasValue)
+        {
+            conditions.Add("pc.group_id = @groupId");
+        }
+        else if (ungrouped)
+        {
+            conditions.Add("pc.group_id IS NULL");
+        }
+
+        var whereClause = conditions.Count == 0
+            ? ""
+            : $"WHERE {string.Join(" AND ", conditions)}";
+        var computersQuery = $"""
             SELECT
                 pc.client_guid,
                 COALESCE(NULLIF(pc.display_name, ''), pc.current_pc_name) AS display_name,
                 pc.current_pc_name,
                 pc.ip_address,
                 DATE_FORMAT(pc.last_seen, '%Y-%m-%dT%H:%i:%s') AS last_seen,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN TRUE ELSE FALSE END AS is_online,
+                CASE WHEN TIMESTAMPDIFF(SECOND, pc.last_seen, NOW()) <= 120 THEN TRUE ELSE FALSE END AS is_online,
                 COUNT(s.session_id) AS session_count,
-                g.group_name
+                pc.group_id,
+                g.group_name,
+                pc.is_active,
+                pc.sort_order
             FROM pc_instances pc
             LEFT JOIN pc_groups g ON g.group_id = pc.group_id
             LEFT JOIN sessions s ON s.client_guid = pc.client_guid
-            WHERE pc.is_active = TRUE
+            {whereClause}
             GROUP BY pc.instance_id, pc.client_guid, pc.display_name, pc.current_pc_name,
-                     pc.ip_address, pc.last_seen, g.group_name, g.sort_order, pc.sort_order
-            ORDER BY g.sort_order, g.group_name, pc.sort_order, display_name
+                     pc.ip_address, pc.last_seen, pc.group_id, g.group_name, g.sort_order,
+                     pc.is_active, pc.sort_order, pc.first_seen
+            ORDER BY (pc.group_id IS NULL), g.sort_order, g.group_name,
+                     (pc.sort_order = 0), pc.sort_order, pc.first_seen, pc.instance_id
             """;
 
         await using var computersCommand = new MySqlCommand(computersQuery, connection);
+        if (groupId.HasValue)
+        {
+            computersCommand.Parameters.AddWithValue("@groupId", groupId.Value);
+        }
         await using var reader = await computersCommand.ExecuteReaderAsync();
         var computers = new List<ComputerListItem>();
         while (await reader.ReadAsync())
@@ -61,10 +83,336 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 reader.IsDBNull(reader.GetOrdinal("last_seen")) ? null : reader.GetString("last_seen"),
                 reader.GetBoolean("is_online"),
                 reader.GetInt64("session_count"),
-                reader.IsDBNull(reader.GetOrdinal("group_name")) ? null : reader.GetString("group_name")));
+                reader.IsDBNull(reader.GetOrdinal("group_name")) ? null : reader.GetString("group_name"),
+                reader.IsDBNull(reader.GetOrdinal("group_id")) ? null : reader.GetInt32("group_id"),
+                reader.GetBoolean("is_active"),
+                reader.GetInt32("sort_order")));
         }
 
         return new LogbookData(summary, computers);
+    }
+
+    public async Task<ComputerUpdateResult> UpdateComputerAsync(
+        string clientGuid,
+        string? displayName,
+        int? groupId)
+    {
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        const string computerQuery = """
+            SELECT instance_id, group_id
+            FROM pc_instances
+            WHERE client_guid = @clientGuid
+            FOR UPDATE
+            """;
+        await using var computerCommand = new MySqlCommand(computerQuery, connection, transaction);
+        computerCommand.Parameters.AddWithValue("@clientGuid", clientGuid);
+        await using var computerReader = await computerCommand.ExecuteReaderAsync();
+        if (!await computerReader.ReadAsync())
+        {
+            await computerReader.CloseAsync();
+            await transaction.RollbackAsync();
+            return new ComputerUpdateResult(false, false, false);
+        }
+
+        var currentGroupId = computerReader.IsDBNull(computerReader.GetOrdinal("group_id"))
+            ? (int?)null
+            : computerReader.GetInt32("group_id");
+        await computerReader.CloseAsync();
+
+        if (groupId.HasValue)
+        {
+            const string groupQuery = "SELECT 1 FROM pc_groups WHERE group_id = @groupId";
+            await using var groupCommand = new MySqlCommand(groupQuery, connection, transaction);
+            groupCommand.Parameters.AddWithValue("@groupId", groupId.Value);
+            if (await groupCommand.ExecuteScalarAsync() is null)
+            {
+                await transaction.RollbackAsync();
+                return new ComputerUpdateResult(true, false, false);
+            }
+        }
+
+        if (currentGroupId != groupId)
+        {
+            var maxOrderQuery = groupId.HasValue
+                ? "SELECT COALESCE(MAX(sort_order), 0) FROM pc_instances WHERE group_id = @groupId"
+                : "SELECT COALESCE(MAX(sort_order), 0) FROM pc_instances WHERE group_id IS NULL";
+            await using var maxOrderCommand = new MySqlCommand(maxOrderQuery, connection, transaction);
+            if (groupId.HasValue)
+            {
+                maxOrderCommand.Parameters.AddWithValue("@groupId", groupId.Value);
+            }
+
+            var nextSortOrder = Convert.ToInt32(await maxOrderCommand.ExecuteScalarAsync()) + 10;
+            const string updateWithGroupQuery = """
+                UPDATE pc_instances
+                SET display_name = @displayName, group_id = @groupId, sort_order = @sortOrder
+                WHERE client_guid = @clientGuid
+                """;
+            await using var updateWithGroupCommand =
+                new MySqlCommand(updateWithGroupQuery, connection, transaction);
+            updateWithGroupCommand.Parameters.AddWithValue("@displayName", (object?)displayName ?? DBNull.Value);
+            updateWithGroupCommand.Parameters.AddWithValue("@groupId", (object?)groupId ?? DBNull.Value);
+            updateWithGroupCommand.Parameters.AddWithValue("@sortOrder", nextSortOrder);
+            updateWithGroupCommand.Parameters.AddWithValue("@clientGuid", clientGuid);
+            await updateWithGroupCommand.ExecuteNonQueryAsync();
+        }
+        else
+        {
+            const string updateDisplayNameQuery = """
+                UPDATE pc_instances
+                SET display_name = @displayName
+                WHERE client_guid = @clientGuid
+                """;
+            await using var updateDisplayNameCommand =
+                new MySqlCommand(updateDisplayNameQuery, connection, transaction);
+            updateDisplayNameCommand.Parameters.AddWithValue("@displayName", (object?)displayName ?? DBNull.Value);
+            updateDisplayNameCommand.Parameters.AddWithValue("@clientGuid", clientGuid);
+            await updateDisplayNameCommand.ExecuteNonQueryAsync();
+        }
+
+        var duplicateName = false;
+        if (displayName is not null)
+        {
+            const string duplicateQuery = """
+                SELECT EXISTS(
+                    SELECT 1 FROM pc_instances
+                    WHERE client_guid <> @clientGuid
+                      AND COALESCE(NULLIF(display_name, ''), current_pc_name) = @displayName
+                )
+                """;
+            await using var duplicateCommand = new MySqlCommand(duplicateQuery, connection, transaction);
+            duplicateCommand.Parameters.AddWithValue("@clientGuid", clientGuid);
+            duplicateCommand.Parameters.AddWithValue("@displayName", displayName);
+            duplicateName = Convert.ToInt32(await duplicateCommand.ExecuteScalarAsync()) != 0;
+        }
+
+        await transaction.CommitAsync();
+        return new ComputerUpdateResult(true, true, duplicateName);
+    }
+
+    public async Task<bool> SetComputerActiveAsync(string clientGuid, bool isActive)
+    {
+        const string query = """
+            UPDATE pc_instances
+            SET is_active = @isActive
+            WHERE client_guid = @clientGuid
+            """;
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var command = new MySqlCommand(query, connection);
+        command.Parameters.AddWithValue("@isActive", isActive);
+        command.Parameters.AddWithValue("@clientGuid", clientGuid);
+        return await command.ExecuteNonQueryAsync() > 0;
+    }
+
+    public async Task<ComputerMoveResult> MoveComputerAsync(string clientGuid, string direction)
+    {
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        const string targetQuery = """
+            SELECT instance_id, group_id
+            FROM pc_instances
+            WHERE client_guid = @clientGuid
+            """;
+        await using var targetCommand = new MySqlCommand(targetQuery, connection, transaction);
+        targetCommand.Parameters.AddWithValue("@clientGuid", clientGuid);
+        await using var targetReader = await targetCommand.ExecuteReaderAsync();
+        if (!await targetReader.ReadAsync())
+        {
+            await targetReader.CloseAsync();
+            await transaction.RollbackAsync();
+            return ComputerMoveResult.NotFound;
+        }
+
+        var targetInstanceId = targetReader.GetInt32("instance_id");
+        var groupId = targetReader.IsDBNull(targetReader.GetOrdinal("group_id"))
+            ? (int?)null
+            : targetReader.GetInt32("group_id");
+        await targetReader.CloseAsync();
+
+        var groupCondition = groupId.HasValue ? "pc.group_id = @groupId" : "pc.group_id IS NULL";
+        var membersQuery = $"""
+            SELECT pc.instance_id, pc.sort_order, pc.is_active
+            FROM pc_instances pc
+            LEFT JOIN pc_groups g ON g.group_id = pc.group_id
+            WHERE {groupCondition}
+            ORDER BY (pc.group_id IS NULL), g.sort_order, g.group_name,
+                     (pc.sort_order = 0), pc.sort_order, pc.first_seen, pc.instance_id
+            FOR UPDATE
+            """;
+        await using var membersCommand = new MySqlCommand(membersQuery, connection, transaction);
+        if (groupId.HasValue)
+        {
+            membersCommand.Parameters.AddWithValue("@groupId", groupId.Value);
+        }
+
+        var members = new List<ComputerMoveMember>();
+        await using (var membersReader = await membersCommand.ExecuteReaderAsync())
+        {
+            while (await membersReader.ReadAsync())
+            {
+                members.Add(new ComputerMoveMember(
+                    membersReader.GetInt32("instance_id"),
+                    membersReader.GetInt32("sort_order"),
+                    membersReader.GetBoolean("is_active")));
+            }
+        }
+
+        var targetIndex = members.FindIndex(member => member.InstanceId == targetInstanceId);
+        if (targetIndex < 0)
+        {
+            await transaction.RollbackAsync();
+            return ComputerMoveResult.GroupChanged;
+        }
+
+        await using (var renumberCommand = new MySqlCommand(
+            "UPDATE pc_instances SET sort_order = @sortOrder WHERE instance_id = @instanceId",
+            connection,
+            transaction))
+        {
+            var sortOrderParameter = renumberCommand.Parameters.Add("@sortOrder", MySqlDbType.Int32);
+            var instanceIdParameter = renumberCommand.Parameters.Add("@instanceId", MySqlDbType.Int32);
+            for (var index = 0; index < members.Count; index++)
+            {
+                sortOrderParameter.Value = (index + 1) * 10;
+                instanceIdParameter.Value = members[index].InstanceId;
+                await renumberCommand.ExecuteNonQueryAsync();
+            }
+        }
+
+        var step = direction == "up" ? -1 : 1;
+        var neighbourIndex = targetIndex + step;
+        while (neighbourIndex >= 0 &&
+               neighbourIndex < members.Count &&
+               members[neighbourIndex].IsActive != members[targetIndex].IsActive)
+        {
+            neighbourIndex += step;
+        }
+
+        if (neighbourIndex < 0 || neighbourIndex >= members.Count)
+        {
+            await transaction.CommitAsync();
+            return direction == "up"
+                ? ComputerMoveResult.AlreadyFirst
+                : ComputerMoveResult.AlreadyLast;
+        }
+
+        await using var swapCommand = new MySqlCommand(
+            "UPDATE pc_instances SET sort_order = @sortOrder WHERE instance_id = @instanceId",
+            connection,
+            transaction);
+        var swapSortOrderParameter = swapCommand.Parameters.Add("@sortOrder", MySqlDbType.Int32);
+        var swapInstanceIdParameter = swapCommand.Parameters.Add("@instanceId", MySqlDbType.Int32);
+
+        swapSortOrderParameter.Value = (neighbourIndex + 1) * 10;
+        swapInstanceIdParameter.Value = members[targetIndex].InstanceId;
+        await swapCommand.ExecuteNonQueryAsync();
+        swapSortOrderParameter.Value = (targetIndex + 1) * 10;
+        swapInstanceIdParameter.Value = members[neighbourIndex].InstanceId;
+        await swapCommand.ExecuteNonQueryAsync();
+
+        await transaction.CommitAsync();
+        return ComputerMoveResult.Moved;
+    }
+
+    public async Task<IReadOnlyList<ComputerGroup>> GetGroupsAsync()
+    {
+        const string query = """
+            SELECT g.group_id, g.group_name, g.sort_order, COUNT(pc.instance_id) AS pc_count
+            FROM pc_groups g
+            LEFT JOIN pc_instances pc ON pc.group_id = g.group_id
+            GROUP BY g.group_id, g.group_name, g.sort_order
+            ORDER BY g.sort_order, g.group_name, g.group_id
+            """;
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var command = new MySqlCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        var groups = new List<ComputerGroup>();
+        while (await reader.ReadAsync())
+        {
+            groups.Add(new ComputerGroup(
+                reader.GetInt32("group_id"),
+                reader.GetString("group_name"),
+                reader.GetInt32("sort_order"),
+                reader.GetInt64("pc_count")));
+        }
+        return groups;
+    }
+
+    public async Task<int> CreateGroupAsync(string name)
+    {
+        const string query = """
+            INSERT INTO pc_groups (group_name)
+            VALUES (@groupName)
+            """;
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var command = new MySqlCommand(query, connection);
+        command.Parameters.AddWithValue("@groupName", name);
+        await command.ExecuteNonQueryAsync();
+        return Convert.ToInt32(command.LastInsertedId);
+    }
+
+    public async Task<bool> RenameGroupAsync(int groupId, string name)
+    {
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        const string existsQuery = "SELECT 1 FROM pc_groups WHERE group_id = @groupId FOR UPDATE";
+        await using var existsCommand = new MySqlCommand(existsQuery, connection, transaction);
+        existsCommand.Parameters.AddWithValue("@groupId", groupId);
+        if (await existsCommand.ExecuteScalarAsync() is null)
+        {
+            await transaction.RollbackAsync();
+            return false;
+        }
+
+        const string query = """
+            UPDATE pc_groups
+            SET group_name = @groupName
+            WHERE group_id = @groupId
+            """;
+        await using var command = new MySqlCommand(query, connection, transaction);
+        command.Parameters.AddWithValue("@groupName", name);
+        command.Parameters.AddWithValue("@groupId", groupId);
+        await command.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+        return true;
+    }
+
+    public async Task<GroupDeleteResult> DeleteGroupAsync(int groupId)
+    {
+        await using var connection = database.CreateConnection();
+        await connection.OpenAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+
+        const string existsQuery = "SELECT 1 FROM pc_groups WHERE group_id = @groupId FOR UPDATE";
+        await using var existsCommand = new MySqlCommand(existsQuery, connection, transaction);
+        existsCommand.Parameters.AddWithValue("@groupId", groupId);
+        if (await existsCommand.ExecuteScalarAsync() is null)
+        {
+            await transaction.RollbackAsync();
+            return new GroupDeleteResult(false, 0);
+        }
+
+        const string countQuery = "SELECT COUNT(*) FROM pc_instances WHERE group_id = @groupId";
+        await using var countCommand = new MySqlCommand(countQuery, connection, transaction);
+        countCommand.Parameters.AddWithValue("@groupId", groupId);
+        var affectedComputers = Convert.ToInt32(await countCommand.ExecuteScalarAsync());
+
+        const string deleteQuery = "DELETE FROM pc_groups WHERE group_id = @groupId";
+        await using var deleteCommand = new MySqlCommand(deleteQuery, connection, transaction);
+        deleteCommand.Parameters.AddWithValue("@groupId", groupId);
+        await deleteCommand.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+        return new GroupDeleteResult(true, affectedComputers);
     }
 
     public async Task<ComputerDetail?> GetComputerAsync(string clientGuid)
@@ -80,10 +428,10 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 pc.ip_address,
                 DATE_FORMAT(pc.last_seen, '%Y-%m-%dT%H:%i:%s') AS last_seen,
                 DATE_FORMAT(pc.first_seen, '%Y-%m-%dT%H:%i:%s') AS first_seen,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN TRUE ELSE FALSE END AS is_online,
+                CASE WHEN TIMESTAMPDIFF(SECOND, pc.last_seen, NOW()) <= 120 THEN TRUE ELSE FALSE END AS is_online,
                 (SELECT COUNT(*) FROM sessions s
                     WHERE s.client_guid = pc.client_guid AND s.login_time >= CURRENT_DATE()) AS sessions_today,
-                CASE WHEN pc.last_seen >= NOW() - INTERVAL 1 MINUTE THEN
+                CASE WHEN TIMESTAMPDIFF(SECOND, pc.last_seen, NOW()) <= 120 THEN
                     (SELECT s.student_name FROM sessions s
                         WHERE s.client_guid = pc.client_guid AND s.logout_time IS NULL
                         ORDER BY s.login_time DESC LIMIT 1)
@@ -134,7 +482,13 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 (s.student_name LIKE CONCAT('%', @search, '%')
                     OR s.student_id LIKE CONCAT('%', @search, '%')
                     OR st.email LIKE CONCAT('%', @search, '%')
-                    OR s.pc_name LIKE CONCAT('%', @search, '%'))
+                    OR COALESCE(
+                        NULLIF(pc.display_name, ''),
+                        NULLIF(pc.current_pc_name, ''),
+                        NULLIF(pc.first_pc_name, ''),
+                        s.pc_name
+                    )
+                        LIKE CONCAT('%', @search, '%'))
                 """);
         }
 
@@ -143,17 +497,28 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             SELECT
                 s.session_id,
                 s.client_guid,
-                s.pc_name,
+                COALESCE(
+                    NULLIF(pc.display_name, ''),
+                    NULLIF(pc.current_pc_name, ''),
+                    NULLIF(pc.first_pc_name, ''),
+                    s.pc_name
+                ) AS computer,
                 s.student_name,
                 st.email,
                 s.student_id,
                 DATE_FORMAT(s.login_time, '%Y-%m-%dT%H:%i:%s') AS login_time,
                 CASE WHEN s.logout_time IS NULL THEN NULL
                     ELSE DATE_FORMAT(s.logout_time, '%Y-%m-%dT%H:%i:%s') END AS logout_time,
-                COALESCE(s.duration_minutes,
-                    CASE WHEN s.logout_time IS NOT NULL AND s.login_time IS NOT NULL
-                        THEN TIMESTAMPDIFF(MINUTE, s.login_time, s.logout_time) END) AS duration_minutes,
-                CASE WHEN s.logout_time IS NULL AND pc.last_seen >= NOW() - INTERVAL 1 MINUTE
+                COALESCE(
+                    s.duration_minutes,
+                    IF(
+                        s.logout_time IS NOT NULL,
+                        TIMESTAMPDIFF(MINUTE, s.login_time, s.logout_time),
+                        NULL
+                    )
+                ) AS duration_minutes,
+                CASE WHEN s.logout_time IS NULL
+                    AND TIMESTAMPDIFF(SECOND, pc.last_seen, NOW()) <= 120
                     THEN 'In use'
                     ELSE COALESCE(NULLIF(s.end_reason, ''), '—')
                 END AS remarks
@@ -167,17 +532,6 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
 
         await using var connection = database.CreateConnection();
         await connection.OpenAsync();
-        await using (var fillDurationsCommand = new MySqlCommand("""
-            UPDATE sessions
-            SET duration_minutes = TIMESTAMPDIFF(MINUTE, login_time, logout_time)
-            WHERE duration_minutes IS NULL
-                AND logout_time IS NOT NULL
-                AND login_time IS NOT NULL
-            """, connection))
-        {
-            await fillDurationsCommand.ExecuteNonQueryAsync();
-        }
-
         await using var command = new MySqlCommand(query, connection);
         if (fromDate is { } start)
         {
@@ -203,7 +557,7 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             sessions.Add(new SessionRecord(
                 reader.GetInt32("session_id"),
                 reader.GetString("client_guid"),
-                reader.GetString("pc_name"),
+                reader.GetString("computer"),
                 reader.GetString("student_name"),
                 reader.IsDBNull(reader.GetOrdinal("email")) ? null : reader.GetString("email"),
                 reader.GetString("student_id"),
@@ -219,13 +573,21 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
     public async Task<IReadOnlyList<ProblemReport>> GetReportsAsync()
     {
         const string query = """
-            SELECT report_id, client_guid, pc_name, student_id, student_name, message, status,
-                   DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at,
-                   CASE WHEN resolved_at IS NULL THEN NULL
-                       ELSE DATE_FORMAT(resolved_at, '%Y-%m-%dT%H:%i:%s') END AS resolved_at,
-                   resolved_by
-            FROM problem_reports
-            ORDER BY created_at DESC, report_id DESC
+            SELECT r.report_id, r.client_guid,
+                   COALESCE(
+                       NULLIF(pc.display_name, ''),
+                       NULLIF(pc.current_pc_name, ''),
+                       NULLIF(pc.first_pc_name, ''),
+                       r.pc_name
+                   ) AS computer,
+                   r.student_id, r.student_name, r.message, r.status,
+                   DATE_FORMAT(r.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at,
+                   CASE WHEN r.resolved_at IS NULL THEN NULL
+                       ELSE DATE_FORMAT(r.resolved_at, '%Y-%m-%dT%H:%i:%s') END AS resolved_at,
+                   r.resolved_by
+            FROM problem_reports r
+            LEFT JOIN pc_instances pc ON pc.client_guid = r.client_guid
+            ORDER BY r.created_at DESC, r.report_id DESC
             LIMIT 500
             """;
 
@@ -239,7 +601,7 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             reports.Add(new ProblemReport(
                 reader.GetInt32("report_id"),
                 reader.GetString("client_guid"),
-                reader.GetString("pc_name"),
+                reader.GetString("computer"),
                 reader.GetString("student_id"),
                 reader.GetString("student_name"),
                 reader.GetString("message"),
@@ -617,7 +979,22 @@ internal sealed record ComputerListItem(
     string? LastSeen,
     bool IsOnline,
     long SessionCount,
-    string? GroupName);
+    string? GroupName,
+    int? GroupId,
+    bool IsActive,
+    int SortOrder);
+internal sealed record ComputerUpdateResult(bool Found, bool GroupExists, bool DuplicateName);
+internal enum ComputerMoveResult
+{
+    NotFound,
+    GroupChanged,
+    AlreadyFirst,
+    AlreadyLast,
+    Moved
+}
+internal sealed record ComputerMoveMember(int InstanceId, int SortOrder, bool IsActive);
+internal sealed record ComputerGroup(int GroupId, string GroupName, int SortOrder, long PcCount);
+internal sealed record GroupDeleteResult(bool Found, int AffectedComputers);
 internal sealed record ComputerDetail(
     string ClientGuid,
     string DisplayName,

@@ -157,18 +157,196 @@ api.MapGet("/health", async (DatabaseConnectionFactory databaseFactory) =>
     return Results.Ok(new { databaseTime = Convert.ToString(databaseTime) });
 });
 
-api.MapGet("/logbook", (SchoolPcDataRepository repository) =>
-    repository.GetLogbookAsync());
+api.MapGet("/logbook", async (
+    string? groupId,
+    SchoolPcDataRepository repository) =>
+{
+    var groupValue = (groupId ?? "all").Trim().ToLowerInvariant();
+    int? selectedGroupId = null;
+    var ungrouped = false;
+    if (groupValue == "none")
+    {
+        ungrouped = true;
+    }
+    else if (groupValue != "all")
+    {
+        if (!int.TryParse(groupValue, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsedGroupId) ||
+            parsedGroupId <= 0)
+        {
+            return Results.BadRequest(new { message = "Group must be all, none, or a valid group identifier." });
+        }
+        selectedGroupId = parsedGroupId;
+    }
+
+    return Results.Ok(await repository.GetLogbookAsync(selectedGroupId, ungrouped));
+});
 
 api.MapGet("/computers/{clientGuid}", async (string clientGuid, SchoolPcDataRepository repository) =>
 {
-    if (clientGuid.Length > 36)
+    if (!Guid.TryParse(clientGuid, out var parsedClientGuid))
     {
         return Results.BadRequest(new { message = "Invalid computer identifier." });
     }
 
-    var computer = await repository.GetComputerAsync(clientGuid);
+    var computer = await repository.GetComputerAsync(parsedClientGuid.ToString("D"));
     return computer is null ? Results.NotFound() : Results.Ok(computer);
+});
+
+api.MapPatch("/computers/{clientGuid}", async (
+    string clientGuid,
+    UpdateComputerRequest request,
+    SchoolPcDataRepository repository) =>
+{
+    if (!Guid.TryParse(clientGuid, out var parsedClientGuid))
+    {
+        return Results.BadRequest(new { message = "Invalid computer identifier." });
+    }
+
+    var displayName = request.DisplayName?.Trim();
+    displayName = string.IsNullOrEmpty(displayName) ? null : displayName;
+    if (displayName?.Length > 150 || request.GroupId is <= 0)
+    {
+        return Results.BadRequest(new { message = "Display name must be at most 150 characters and group must be valid." });
+    }
+
+    try
+    {
+        var result = await repository.UpdateComputerAsync(
+            parsedClientGuid.ToString("D"),
+            displayName,
+            request.GroupId);
+        if (!result.Found)
+        {
+            return Results.NotFound();
+        }
+        if (!result.GroupExists)
+        {
+            return Results.BadRequest(new { message = "The selected group does not exist." });
+        }
+
+        return Results.Ok(new
+        {
+            warning = result.DuplicateName,
+            message = result.DuplicateName ? "Another PC already uses this display name." : null
+        });
+    }
+    catch (MySqlException exception) when (exception.Number == 1451)
+    {
+        return Results.Conflict(new { message = "The selected group is no longer available. Refresh and try again." });
+    }
+});
+
+api.MapPatch("/computers/{clientGuid}/active", async (
+    string clientGuid,
+    ComputerActiveRequest request,
+    SchoolPcDataRepository repository) =>
+{
+    if (!Guid.TryParse(clientGuid, out var parsedClientGuid))
+    {
+        return Results.BadRequest(new { message = "Invalid computer identifier." });
+    }
+
+    var updated = await repository.SetComputerActiveAsync(
+        parsedClientGuid.ToString("D"),
+        request.IsActive);
+    return updated ? Results.NoContent() : Results.NotFound();
+});
+
+api.MapPost("/computers/{clientGuid}/move", async (
+    string clientGuid,
+    MoveComputerRequest request,
+    SchoolPcDataRepository repository) =>
+{
+    if (!Guid.TryParse(clientGuid, out var parsedClientGuid))
+    {
+        return Results.BadRequest(new { message = "Invalid computer identifier." });
+    }
+    if (request.Direction is not ("up" or "down"))
+    {
+        return Results.BadRequest(new { message = "Direction must be up or down." });
+    }
+
+    var result = await repository.MoveComputerAsync(
+        parsedClientGuid.ToString("D"),
+        request.Direction);
+    return result switch
+    {
+        ComputerMoveResult.NotFound => Results.NotFound(),
+        ComputerMoveResult.GroupChanged => Results.Conflict(
+            new { message = "The PC's group changed while it was being moved. Refresh and try again." }),
+        ComputerMoveResult.AlreadyFirst => Results.Ok(new { moved = false, message = "This PC is already first." }),
+        ComputerMoveResult.AlreadyLast => Results.Ok(new { moved = false, message = "This PC is already last." }),
+        _ => Results.Ok(new { moved = true, message = "PC order updated." })
+    };
+});
+
+api.MapGet("/groups", (SchoolPcDataRepository repository) =>
+    repository.GetGroupsAsync());
+
+api.MapPost("/groups", async (
+    ComputerGroupRequest request,
+    SchoolPcDataRepository repository) =>
+{
+    var name = request.Name?.Trim();
+    if (string.IsNullOrEmpty(name) || name.Length > 100)
+    {
+        return Results.BadRequest(new { message = "Group name must be between 1 and 100 characters." });
+    }
+
+    try
+    {
+        var groupId = await repository.CreateGroupAsync(name);
+        return Results.Created($"/api/groups/{groupId}", new { groupId, groupName = name });
+    }
+    catch (MySqlException exception) when (exception.Number == 1062)
+    {
+        return Results.Conflict(new { message = "A group with this name already exists." });
+    }
+});
+
+api.MapPatch("/groups/{groupId:int}", async (
+    int groupId,
+    ComputerGroupRequest request,
+    SchoolPcDataRepository repository) =>
+{
+    var name = request.Name?.Trim();
+    if (groupId <= 0 || string.IsNullOrEmpty(name) || name.Length > 100)
+    {
+        return Results.BadRequest(new { message = "Group name must be between 1 and 100 characters." });
+    }
+
+    try
+    {
+        var updated = await repository.RenameGroupAsync(groupId, name);
+        return updated ? Results.NoContent() : Results.NotFound();
+    }
+    catch (MySqlException exception) when (exception.Number == 1062)
+    {
+        return Results.Conflict(new { message = "A group with this name already exists." });
+    }
+});
+
+api.MapDelete("/groups/{groupId:int}", async (
+    int groupId,
+    SchoolPcDataRepository repository) =>
+{
+    if (groupId <= 0)
+    {
+        return Results.BadRequest(new { message = "Invalid group identifier." });
+    }
+
+    try
+    {
+        var result = await repository.DeleteGroupAsync(groupId);
+        return result.Found
+            ? Results.Ok(new { affectedComputers = result.AffectedComputers })
+            : Results.NotFound();
+    }
+    catch (MySqlException exception) when (exception.Number == 1451)
+    {
+        return Results.Conflict(new { message = "This group cannot be deleted while it is in use." });
+    }
 });
 
 api.MapGet("/history", async (
@@ -181,6 +359,15 @@ api.MapGet("/history", async (
     if (!IsValidDate(from) || !IsValidDate(to))
     {
         return Results.BadRequest(new { message = "Dates must use yyyy-MM-dd format." });
+    }
+
+    if (!string.IsNullOrWhiteSpace(clientGuid))
+    {
+        if (!Guid.TryParse(clientGuid, out var parsedClientGuid))
+        {
+            return Results.BadRequest(new { message = "Invalid computer identifier." });
+        }
+        clientGuid = parsedClientGuid.ToString("D");
     }
 
     return Results.Ok(await repository.GetSessionsAsync(from, to, clientGuid, search));
@@ -291,8 +478,18 @@ api.MapDelete("/accounts/students/{studentId}", async (
         return Results.BadRequest(new { message = "Invalid student identifier." });
     }
 
-    var deleted = await repository.DeleteStudentAccountAsync(studentId);
-    return deleted ? Results.NoContent() : Results.NotFound();
+    try
+    {
+        var deleted = await repository.DeleteStudentAccountAsync(studentId);
+        return deleted ? Results.NoContent() : Results.NotFound();
+    }
+    catch (MySqlException exception) when (exception.Number == 1451)
+    {
+        return Results.Conflict(new
+        {
+            message = "This student has logbook history and can't be deleted. Disable the account instead."
+        });
+    }
 });
 
 api.MapPost("/accounts/students/{studentId}/ban", async (
@@ -490,6 +687,10 @@ internal sealed record LoginRequest(string? Username, string? Password);
 internal sealed record ReportStatusRequest(bool Resolved);
 internal sealed record DeleteResolvedReportsRequest(List<int>? ReportIds);
 internal sealed record AccountActiveRequest(bool IsActive);
+internal sealed record ComputerActiveRequest(bool IsActive);
+internal sealed record UpdateComputerRequest(string? DisplayName, int? GroupId);
+internal sealed record MoveComputerRequest(string? Direction);
+internal sealed record ComputerGroupRequest(string? Name);
 internal sealed record BanStudentRequest(string? Reason);
 internal sealed record StudentAccountRequest(
     string StudentId,

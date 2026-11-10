@@ -14,6 +14,16 @@ export interface ComputerRecord {
   isOnline: boolean;
   sessionCount: number;
   groupName: string | null;
+  groupId: number | null;
+  isActive: boolean;
+  sortOrder: number;
+}
+
+export interface ComputerGroup {
+  groupId: number;
+  groupName: string;
+  sortOrder: number;
+  pcCount: number;
 }
 
 export interface LogbookData {

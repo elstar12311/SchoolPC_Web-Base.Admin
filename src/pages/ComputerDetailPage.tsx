@@ -25,7 +25,8 @@ export default function ComputerDetailPage() {
     return (
       <>
         <Link className="back-button" to="/logbook">
-          ← Back to computers
+          <Icon name="chevron" size={17} />
+          <span>Back to computers</span>
         </Link>
         <DataState
           empty={!computerResource.loading && !computerResource.error && !computer}
@@ -42,7 +43,8 @@ export default function ComputerDetailPage() {
   return (
     <>
       <Link className="back-button" to="/logbook">
-        ← Back to computers
+        <Icon name="chevron" size={17} />
+        <span>Back to computers</span>
       </Link>
       <section className="detail-hero">
         <div className="detail-icon">
@@ -64,7 +66,7 @@ export default function ComputerDetailPage() {
       </section>
       <section className="detail-stats">
         <article>
-          <span>Client ID</span>
+          <span>PC Unique ID</span>
           <strong className="mono client-id-value">{computer.clientGuid}</strong>
         </article>
         <article>

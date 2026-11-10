@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { ApiError, apiRequest } from "../api";
 import type { AccountDirectory, AdminAccount, BannedStudent, StudentAccount } from "../data";
 import { initials } from "../data";
@@ -107,6 +107,41 @@ export default function AccountManagementPage() {
     form.password,
     formMode !== null && editing === null && validationAttempted,
   );
+
+  useEffect(() => {
+    if (!openMenu) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      if (
+        event.target instanceof Element &&
+        event.target.closest("[data-account-action-menu], [data-account-action-trigger]")
+      ) {
+        return;
+      }
+      setOpenMenu(null);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpenMenu(null);
+    }
+
+    function handleScroll() {
+      setOpenMenu(null);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("scroll", handleScroll, true);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
+  }, [openMenu]);
+
+  function toggleActionMenu(menuId: string) {
+    setOpenMenu((current) => (current === menuId ? null : menuId));
+  }
 
   const filteredRows = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -541,19 +576,15 @@ export default function AccountManagementPage() {
                                 aria-expanded={openMenu === `student-${student.studentId}`}
                                 aria-label={`Actions for ${student.fullName}`}
                                 className="dots-button"
-                                onClick={() =>
-                                  setOpenMenu((current) =>
-                                    current === `student-${student.studentId}`
-                                      ? null
-                                      : `student-${student.studentId}`,
-                                  )
-                                }
+                                data-account-action-trigger
+                                onClick={() => toggleActionMenu(`student-${student.studentId}`)}
                               >
                                 <Icon name="dots" />
                               </button>
                               {openMenu === `student-${student.studentId}` && (
                                 <div
                                   className={`action-menu ${index >= filteredRows.students.length - 2 ? "action-menu-up" : ""}`}
+                                  data-account-action-menu
                                 >
                                   <button onClick={() => startEdit(student, "student")}>
                                     Edit
@@ -618,19 +649,15 @@ export default function AccountManagementPage() {
                                 aria-expanded={openMenu === `admin-${admin.adminId}`}
                                 aria-label={`Actions for ${admin.fullName}`}
                                 className="dots-button"
-                                onClick={() =>
-                                  setOpenMenu((current) =>
-                                    current === `admin-${admin.adminId}`
-                                      ? null
-                                      : `admin-${admin.adminId}`,
-                                  )
-                                }
+                                data-account-action-trigger
+                                onClick={() => toggleActionMenu(`admin-${admin.adminId}`)}
                               >
                                 <Icon name="dots" />
                               </button>
                               {openMenu === `admin-${admin.adminId}` && (
                                 <div
                                   className={`action-menu ${index >= filteredRows.admins.length - 2 ? "action-menu-up" : ""}`}
+                                  data-account-action-menu
                                 >
                                   <button onClick={() => startEdit(admin, "admin")}>Edit</button>
                                   <button onClick={() => void toggleActive(admin)}>
@@ -679,17 +706,15 @@ export default function AccountManagementPage() {
                                 aria-expanded={openMenu === `ban-${ban.banId}`}
                                 aria-label={`Actions for ban on ${ban.fullName}`}
                                 className="dots-button"
-                                onClick={() =>
-                                  setOpenMenu((current) =>
-                                    current === `ban-${ban.banId}` ? null : `ban-${ban.banId}`,
-                                  )
-                                }
+                                data-account-action-trigger
+                                onClick={() => toggleActionMenu(`ban-${ban.banId}`)}
                               >
                                 <Icon name="dots" />
                               </button>
                               {openMenu === `ban-${ban.banId}` && (
                                 <div
                                   className={`action-menu ${index >= filteredRows.banned.length - 2 ? "action-menu-up" : ""}`}
+                                  data-account-action-menu
                                 >
                                   <button onClick={() => void unbanStudent(ban)}>
                                     Unban student
