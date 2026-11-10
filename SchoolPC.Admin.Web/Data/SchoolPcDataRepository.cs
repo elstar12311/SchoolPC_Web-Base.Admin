@@ -484,8 +484,6 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                     OR st.email LIKE CONCAT('%', @search, '%')
                     OR COALESCE(
                         NULLIF(pc.display_name, ''),
-                        NULLIF(pc.current_pc_name, ''),
-                        NULLIF(pc.first_pc_name, ''),
                         s.pc_name
                     )
                         LIKE CONCAT('%', @search, '%'))
@@ -499,8 +497,6 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
                 s.client_guid,
                 COALESCE(
                     NULLIF(pc.display_name, ''),
-                    NULLIF(pc.current_pc_name, ''),
-                    NULLIF(pc.first_pc_name, ''),
                     s.pc_name
                 ) AS computer,
                 s.student_name,
@@ -576,8 +572,6 @@ internal sealed class SchoolPcDataRepository(DatabaseConnectionFactory database)
             SELECT r.report_id, r.client_guid,
                    COALESCE(
                        NULLIF(pc.display_name, ''),
-                       NULLIF(pc.current_pc_name, ''),
-                       NULLIF(pc.first_pc_name, ''),
                        r.pc_name
                    ) AS computer,
                    r.student_id, r.student_name, r.message, r.status,
